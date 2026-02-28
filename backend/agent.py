@@ -1,5 +1,4 @@
 import asyncio
-import importlib
 import json
 import logging
 import os
@@ -18,6 +17,16 @@ from livekit.plugins import noise_cancellation, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from backend.env_loader import load_backend_env
 
+try:
+    from livekit.plugins import deepgram as deepgram_plugin
+except Exception:  # pragma: no cover - optional plugin at runtime
+    deepgram_plugin = None
+
+try:
+    from livekit.plugins import google as google_plugin
+except Exception:  # pragma: no cover - optional plugin at runtime
+    google_plugin = None
+
 load_backend_env()
 
 logging.basicConfig(
@@ -32,23 +41,33 @@ def _build_stt():
     api_key = os.environ.get("DEEPGRAM_API_KEY")
     model = os.environ.get("DEEPGRAM_STT_MODEL", "nova-3")
     language = os.environ.get("DEEPGRAM_STT_LANGUAGE", "multi")
+    default_streaming_language = os.environ.get("DEEPGRAM_STT_DEFAULT_LANGUAGE", "en-US")
 
-    if api_key:
+    if api_key and deepgram_plugin is not None:
         try:
-            deepgram = importlib.import_module("livekit.plugins.deepgram")
-            # "multi" means multilingual auto-detection; map to detect_language=True
+            # Deepgram streaming mode does not support detect_language=True.
+            # Use an explicit language for streaming STT.
             if language == "multi":
-                stt = deepgram.STT(model=model, detect_language=True, api_key=api_key)
+                stt = deepgram_plugin.STT(model=model, language=default_streaming_language, api_key=api_key)
+                logger.warning(
+                    "DEEPGRAM_STT_LANGUAGE=multi is not supported for streaming STT; using '%s' instead.",
+                    default_streaming_language,
+                )
             else:
-                stt = deepgram.STT(model=model, language=language, api_key=api_key)
+                stt = deepgram_plugin.STT(model=model, language=language, api_key=api_key)
             logger.info(
                 "STT configured via direct Deepgram API | model=%s | language=%s",
                 model,
-                language,
+                default_streaming_language if language == "multi" else language,
             )
             return stt
         except Exception as exc:
-            logger.warning("Deepgram plugin unavailable, using gateway STT fallback: %s", exc)
+            logger.warning("Deepgram STT init failed, using gateway STT fallback: %s", exc)
+
+    if not api_key:
+        logger.warning("DEEPGRAM_API_KEY not found; using gateway STT fallback.")
+    elif deepgram_plugin is None:
+        logger.warning("Deepgram plugin unavailable in main thread; using gateway STT fallback.")
 
     gateway_str = f"deepgram/{model}:{language}"
     logger.warning(
@@ -60,20 +79,52 @@ def _build_stt():
     return gateway_str
 
 
+def _build_tts():
+    """Use direct Deepgram TTS when DEEPGRAM_API_KEY is set to avoid LiveKit gateway 429s."""
+    api_key = os.environ.get("DEEPGRAM_API_KEY")
+    model = os.environ.get("DEEPGRAM_TTS_MODEL", "aura-2-andromeda-en")
+
+    if api_key and deepgram_plugin is not None:
+        try:
+            tts_engine = deepgram_plugin.TTS(model=model, api_key=api_key)
+            logger.info("TTS configured via direct Deepgram API | model=%s", model)
+            return tts_engine
+        except Exception as exc:
+            logger.warning("Deepgram TTS init failed, using gateway TTS fallback: %s", exc)
+
+    if not api_key:
+        logger.warning("DEEPGRAM_API_KEY not found; using gateway TTS fallback.")
+    elif deepgram_plugin is None:
+        logger.warning("Deepgram plugin unavailable in main thread; using gateway TTS fallback.")
+
+    fallback = "cartesia/sonic-3:9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"
+    logger.warning(
+        "No DEEPGRAM_API_KEY found; falling back to gateway TTS '%s'. "
+        "This can fail with 429 when gateway quota/rate limits are hit. "
+        "Set DEEPGRAM_API_KEY in backend/.env.local.",
+        fallback,
+    )
+    return fallback
+
+
 def _build_voice_llm():
     """Prefer direct Gemini API to avoid LiveKit gateway credit limits."""
     gemini_api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
     model = os.environ.get("VOICE_LLM_MODEL", "gemini-2.5-flash")
 
-    if gemini_api_key:
+    if gemini_api_key and google_plugin is not None:
         try:
-            google = importlib.import_module("livekit.plugins.google")
             # The LiveKit Google plugin reads GOOGLE_API_KEY.
             os.environ.setdefault("GOOGLE_API_KEY", gemini_api_key)
             logger.info("Voice LLM configured via direct Google plugin | model=%s", model)
-            return google.LLM(model=model, api_key=gemini_api_key)
+            return google_plugin.LLM(model=model, api_key=gemini_api_key)
         except Exception as exc:
-            logger.warning("Google plugin unavailable, using gateway LLM fallback: %s", exc)
+            logger.warning("Google LLM init failed, using gateway LLM fallback: %s", exc)
+
+    if not gemini_api_key:
+        logger.warning("GEMINI/GOOGLE API key not found; using gateway LLM fallback.")
+    elif google_plugin is None:
+        logger.warning("Google plugin unavailable in main thread; using gateway LLM fallback.")
 
     fallback = os.environ.get("VOICE_LLM_FALLBACK", model)
     logger.warning(
@@ -346,6 +397,7 @@ server = AgentServer()
 
 @server.rtc_session(agent_name="my-agent")
 async def my_agent(ctx: agents.JobContext):
+    load_backend_env()
     logger.info("Agent session starting | room=%s", ctx.room.name)
 
     assistant = Assistant(room=ctx.room)
@@ -379,7 +431,7 @@ async def my_agent(ctx: agents.JobContext):
     session = AgentSession(
         stt=_build_stt(),
         llm=_build_voice_llm(),
-        tts="cartesia/sonic-3:9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",
+        tts=_build_tts(),
         vad=silero.VAD.load(),
         turn_detection=MultilingualModel(),
     )
