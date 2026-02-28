@@ -1,1 +1,32 @@
 mcp.json
+
+# Environment / secrets
+.env
+.env.local
+.env*.local
+*.env
+
+# Python
+__pycache__/
+*.py[oc]
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Node / Next.js
+node_modules/
+.next/
+.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+coverage/
+
+# Temp files
+tmpclaude-*
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
